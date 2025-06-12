@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>VoxelCraft – Minecraft‑style sandbox in one file</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#87ceeb;font-family:sans-serif}
+#overlay{position:fixed;top:0;left:0;width:100%;color:#fff;padding:6px 10px;
+         text-shadow:0 0 4px #000;font-size:14px;pointer-events:none}
+#help{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
+      background:rgba(0,0,0,.8);padding:20px 30px;border-radius:8px;
+      max-width:420px;display:none}
+#help pre{margin:0;color:#fff;font-size:14px}
+#crosshair{position:fixed;top:50%;left:50%;width:12px;height:12px;
+           margin:-6px 0 0 -6px;border:2px solid #fff;border-radius:50%;
+           pointer-events:none;opacity:.9}
+button{cursor:pointer;background:#222;color:#fff;padding:6px 14px;border:0;border-radius:4px}
+</style>
+</head>
+<body>
+<div id="overlay">Click to play – Esc for mouse<br/><span id="fps"></span></div>
+<div id="help">
+<pre>
+VoxelCraft – controls
+–––––––––––––––––––––
+W A S D : move          SPACE : jump / double → fly
+SHIFT    : sprint / fly down
+Mouse    : look          L‑click : break block
+R‑click  : place block   1‑9     : block in hot‑bar
+H        : toggle this help
+F        : toggle fly    P       : pause (free mouse)
+Q        : drop held     ESC     : unlock mouse
+</pre>
+<button onclick="toggleHelp()">close</button>
+</div>
+<div id="crosshair"></div>
+
+<!-- lightweight CDNs (two small files, everything else below is inline) -->
+<script src="https://cdn.jsdelivr.net/npm/three@0.161.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/simplex-noise@4.0.1/simplex-noise.min.js"></script>
+
+<script>
+/* ==============================================================
+   CONSTANTS & GLOBALS
+   ============================================================== */
+const CHUNK  = 16;             // blocks per side
+const H      = 64;             // world height
+const SCALE  = 40;             // terrain noise scale
+const WATER  = 18;             // water level (y)
+const BLOCK_SIZE = 1;
+const AIR=0, GRASS=1, DIRT=2, STONE=3, SAND=4,
+      WOOD=5, LEAF=6, WATERB=7, GLASS=8, TORCH=9, WOOL=10;
+const INV = [GRASS, DIRT, STONE, SAND, WOOD, LEAF, GLASS, TORCH];
+let selected=0, fly=false, paused=false;
+
+const simplex=new SimplexNoise('seed');
+let scene,cam,renderer,controls,world={},meshes={},clock,newChunkQueue=[];
+let keys={},mouse={x:0,y:0};
+let player={pos:new THREE.Vector3(0,40,0),vel:new THREE.Vector3(),onGround:false,health:20};
+
+/* ==============================================================
+   TEXTURE GENERATION – tiny 16×16 canvases turned into atlas
+   ============================================================== */
+const txCanvas=document.createElement('canvas');
+txCanvas.width=256;txCanvas.height=16;
+const txCtx=txCanvas.getContext('2d');
+function txFill(idx, color, patternFn){
+  txCtx.fillStyle=color;txCtx.fillRect(idx*16,0,16,16);
+  if(patternFn) patternFn(txCtx, idx*16, 0);
+}
+const noisePix=(x,y)=> (Math.random()>.5);
+txFill(GRASS,'#4caf50',(c,x,y)=>{for(let i=0;i<30;i++){c.fillStyle='#3e8c40';c.fillRect(x+Math.random()*16,y+Math.random()*16,1,1)}});
+txFill(DIRT,'#8d6747',(c,x,y)=>{for(let i=0;i<40;i++){c.fillStyle='#735238';c.fillRect(x+Math.random()*16,y+Math.random()*16,1,1)}});
+txFill(STONE,'#8e8e8e',(c,x,y)=>{for(let i=0;i<50;i++){c.fillStyle='#777';c.fillRect(x+Math.random()*16,y+Math.random()*16,1,1)}});
+txFill(SAND,'#e0d29a',(c,x,y)=>{for(let i=0;i<30;i++){c.fillStyle='#d0c285';c.fillRect(x+Math.random()*16,y+Math.random()*16,1,1)}});
+txFill(WOOD,'#9c6b3c',(c,x,y)=>{c.fillStyle='#7e522d';c.fillRect(x+5,y,2,16);c.fillRect(x+10,y,2,16)});
+txFill(LEAF,'#3fa047',(c,x,y)=>{for(let i=0;i<80;i++){c.fillStyle='#2d7c34';c.fillRect(x+Math.random()*16,y+Math.random()*16,1,1)}});
+txFill(WATERB,'#2d6df1',(c,x,y)=>{c.globalAlpha=.4;c.fillStyle='#1e4cb5';c.fillRect(x,y,16,16);c.globalAlpha=1});
+txFill(GLASS,'#9bdcfb',(c,x,y)=>{c.globalAlpha=.3;c.fillRect(x,y,16,16);c.globalAlpha=1});
+txFill(TORCH,'#a37c28',(c,x,y)=>{c.fillStyle='#d6af38';c.fillRect(x+6,y+2,4,8);c.fillStyle='#fff48a';c.fillRect(x+5,y,6,2)});
+txFill(WOOL,'#d8d8d8',(c,x,y)=>{c.fillStyle='#c0c0c0';c.fillRect(x,y,16,16);});
+const texture=new THREE.CanvasTexture(txCanvas);
+texture.magFilter=THREE.NearestFilter;texture.minFilter=THREE.NearestFilter;
+
+/* block material lookup */
+const mats={};
+for(let i=1;i<=WOOL;i++){
+  mats[i]=new THREE.MeshLambertMaterial({map:texture});
+  mats[i].map.offset.set(i/16,0);
+  mats[i].map.repeat.set(1/16,1);
+}
+
+/* ==============================================================
+   SETUP
+   ============================================================== */
+init();animate();
+
+function init(){
+  scene=new THREE.Scene();
+  scene.fog=new THREE.FogExp2(0x87ceeb,0.015);
+
+  cam=new THREE.PerspectiveCamera(75,innerWidth/innerHeight,0.1,200);
+  cam.position.copy(player.pos);
+
+  renderer=new THREE.WebGLRenderer({antialias:false});
+  renderer.setSize(innerWidth,innerHeight);
+  renderer.setClearColor(0x87ceeb);
+  document.body.appendChild(renderer.domElement);
+
+  /* lights */
+  const sun=new THREE.DirectionalLight(0xffffff,1);
+  sun.position.set(-0.5,1,0.5);scene.add(sun);
+  scene.add(new THREE.AmbientLight(0xffffff,0.5));
+
+  clock=new THREE.Clock();
+
+  document.addEventListener('click', ()=>{if(!paused) lockPointer();});
+  document.addEventListener('pointerlockchange',()=>{paused=!document.pointerLockElement;toggleOverlay()});
+  window.addEventListener('resize',()=>{cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});
+  document.addEventListener('keydown',e=>{keys[e.code]=true;if(e.code==='Digit0')selected=(selected+1)%INV.length;
+    if(e.code==='KeyF')fly=!fly;if(e.code==='KeyH')toggleHelp();if(e.code==='KeyP'){paused=!paused;toggleOverlay()}});
+  document.addEventListener('keyup',e=>{keys[e.code]=false});
+  document.addEventListener('mousemove',e=>{mouse.x=e.movementX;mouse.y=e.movementY});
+  document.addEventListener('mousedown',e=>{if(paused)return;
+      if(e.button===0) interactBlock(false); if(e.button===2) interactBlock(true);});
+
+  /* pre‑warm first 9×9 chunks */
+  for(let cx=-4;cx<=4;cx++) for(let cz=-4;cz<=4;cz++) queueChunk(cx,cz);
+}
+
+/* ==============================================================
+   WORLD / CHUNKS
+   ============================================================== */
+function queueChunk(cx,cz){const key=cx+','+cz;if(world[key])return;newChunkQueue.push([cx,cz])}
+
+function buildChunk(cx,cz){
+  const key=cx+','+cz;if(world[key])return;
+  const geom=new THREE.BoxGeometry(BLOCK_SIZE,BLOCK_SIZE,BLOCK_SIZE);
+  const inst=new THREE.InstancedMesh(geom,Object.values(mats),CHUNK*CHUNK*H);
+  inst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  let ptr=0;
+  const blockID=[];
+  for(let x=0;x<CHUNK;x++)for(let z=0;z<CHUNK;z++){
+    const wx=cx*CHUNK+x, wz=cz*CHUNK+z;
+    const h=Math.floor((simplex.noise2D(wx/SCALE,wz/SCALE)+1)*8+20);
+    for(let y=0;y<H;y++){
+      let id=AIR;
+      if(y>h) id=(y<=WATER)?WATERB:AIR;
+      else if(y===h) id=(y<WATER)?SAND:GRASS;
+      else if(y>h-3) id=(y<WATER)?SAND:DIRT;
+      else id=STONE;
+
+      /* tree */
+      if(id===GRASS && Math.random()<0.02 && y+6<H){
+        makeTree(wx,y+1,wz);
+      }
+
+      if(id!==AIR){
+        const matIndex=id-1;
+        const dummy=new THREE.Object3D();
+        dummy.position.set(wx*BLOCK_SIZE,(y+0.5)*BLOCK_SIZE,wz*BLOCK_SIZE);
+        dummy.updateMatrix();
+        inst.setMatrixAt(ptr,dummy.matrix);
+        inst.setColorAt(ptr,new THREE.Color(matIndex/16,0,0)); // encode mat idx in color attr
+        blockID.push({id,wx,wy:y,wz,ptr});
+        ptr++;
+      }
+    }
+  }
+  inst.count=ptr;
+  inst.instanceMatrix.needsUpdate=true;
+  inst.instanceColor.needsUpdate=true;
+  scene.add(inst);
+  world[key]={mesh:inst, data:blockID};
+}
+
+/* simple 5‑block oak/pine */
+function makeTree(x,y,z){
+  for(let i=0;i<5;i++) setBlock(x,y+i,z,WOOD);
+  for(let ix=-2;ix<=2;ix++) for(let iz=-2;iz<=2;iz++)
+    for(let iy=3;iy<=5;iy++)
+      if(Math.abs(ix)+Math.abs(iz)+iy>5)continue;
+      else setBlock(x+ix,y+iy,z+iz,LEAF);
+}
+
+function setBlock(x,y,z,id){
+  const c={x:Math.floor(x/CHUNK),z:Math.floor(z/CHUNK)};
+  const key=c.x+','+c.z;if(!world[key])return;
+  /* naive: push new block as independent instance */
+  const inst=world[key].mesh;
+  const dummy=new THREE.Object3D();
+  dummy.position.set(x*BLOCK_SIZE,(y+0.5)*BLOCK_SIZE,z*BLOCK_SIZE);
+  dummy.updateMatrix();
+  const idx=inst.count++;
+  inst.setMatrixAt(idx,dummy.matrix);
+  inst.setColorAt(idx,new THREE.Color((id-1)/16,0,0));
+  inst.instanceMatrix.needsUpdate=true;inst.instanceColor.needsUpdate=true;
+}
+
+function removeBlock(wx,wy,wz){
+  const cx=Math.floor(wx/CHUNK), cz=Math.floor(wz/CHUNK);
+  const key=cx+','+cz; if(!world[key])return;
+  const chunk=world[key];const inst=chunk.mesh;
+  /* brute: iterate chunk data */
+  for(let i=0;i<chunk.data.length;i++){
+    const b=chunk.data[i];
+    if(b.wx===wx && b.wy===wy && b.wz===wz){
+      inst.setMatrixAt(b.ptr,new THREE.Matrix4()); // flatten
+      inst.instanceMatrix.needsUpdate=true;
+      return b.id;
+    }
+  }
+  return AIR;
+}
+
+/* ==============================================================
+   MOB – simple sheep cubes
+   ============================================================== */
+class Sheep{
+  constructor(x,y,z){
+    const geo=new THREE.BoxGeometry(.8,.8,.8);
+    const mat=new THREE.MeshLambertMaterial({color:0xffffff});
+    this.mesh=new THREE.Mesh(geo,mat);
+    this.mesh.position.set(x,y,z);
+    this.dir=new THREE.Vector3();
+    this.step();
+    scene.add(this.mesh);
+  }
+  step(){
+    const a=Math.random()*Math.PI*2;
+    this.dir.set(Math.sin(a),0,Math.cos(a));
+    setTimeout(()=>this.step(), 3000+Math.random()*4000);
+  }
+  update(dt){
+    this.mesh.position.addScaledVector(this.dir,dt*2);
+  }
+}
+
+const mobs=[];
+for(let i=0;i<15;i++){
+  mobs.push(new Sheep((Math.random()-0.5)*80,30,(Math.random()-0.5)*80));
+}
+
+/* ==============================================================
+   PLAYER & CONTROLS
+   ============================================================== */
+function lockPointer(){renderer.domElement.requestPointerLock();}
+function toggleOverlay(){document.getElementById('overlay').style.display=paused?'block':'none'}
+
+function toggleHelp(){const el=document.getElementById('help');el.style.display=(el.style.display==='block')?'none':'block'}
+
+function interactBlock(place){
+  const ray=new THREE.Raycaster();
+  ray.setFromCamera({x:0,y:0},cam);
+  const inter=ray.intersectObjects(scene.children,true);
+  if(inter.length){
+    const p=inter[0].point.add(inter[0].face.normal.multiplyScalar(place?0.5:-0.5));
+    const wx=Math.floor(p.x/BLOCK_SIZE);
+    const wy=Math.floor(p.y/BLOCK_SIZE);
+    const wz=Math.floor(p.z/BLOCK_SIZE);
+    if(place){
+      const id=INV[selected];
+      setBlock(wx,wy,wz,id);
+    }else{
+      const removed=removeBlock(wx,wy,wz);
+      if(removed!==AIR){} //TODO: inventory pick‑up
+    }
+  }
+}
+
+/* ==============================================================
+   MAIN LOOP
+   ============================================================== */
+function animate(){
+  requestAnimationFrame(animate);
+  const dt=clock.getDelta();
+  if(!paused){
+    movePlayer(dt);
+    cam.position.copy(player.pos).add(new THREE.Vector3(0,1.6,0));
+    cam.rotation.order='YXZ';
+    cam.rotation.y-=mouse.x*0.002;
+    cam.rotation.x-=mouse.y*0.002;
+    cam.rotation.x=Math.max(-Math.PI/2,Math.min(Math.PI/2,cam.rotation.x));
+    mouse.x=mouse.y=0;
+
+    /* chunk management around player */
+    const pcx=Math.floor(player.pos.x/CHUNK), pcz=Math.floor(player.pos.z/CHUNK);
+    for(let dx=-3;dx<=3;dx++) for(let dz=-3;dz<=3;dz++) queueChunk(pcx+dx,pcz+dz);
+  }
+
+  /* build queued chunks gradually to avoid spikes */
+  if(newChunkQueue.length){const [cx,cz]=newChunkQueue.shift();buildChunk(cx,cz);}
+
+  /* update mobs */
+  mobs.forEach(m=>m.update(dt));
+
+  renderer.render(scene,cam);
+  document.getElementById('fps').textContent=('FPS '+(1/dt|0));
+}
+
+/* simple physics */
+function movePlayer(dt){
+  const acc=new THREE.Vector3();
+  if(keys['KeyW']) acc.z-=1;
+  if(keys['KeyS']) acc.z+=1;
+  if(keys['KeyA']) acc.x-=1;
+  if(keys['KeyD']) acc.x+=1;
+  acc.applyAxisAngle(new THREE.Vector3(0,1,0),cam.rotation.y);
+  acc.setLength(acc.length()>0? (fly?10:6):0);
+  player.vel.x+=acc.x*dt;player.vel.z+=acc.z*dt;
+  if(fly){player.vel.y+=(keys['Space']?6:0)+(keys['ShiftLeft']?-6:0)*dt;}
+  else{
+    player.vel.y-=30*dt; /* gravity */
+    if(player.onGround && keys['Space']) player.vel.y=9;
+  }
+  /* damping */
+  player.vel.multiplyScalar(fly?.92:.89);
+
+  /* move & basic ground detection */
+  const next=player.pos.clone().addScaledVector(player.vel,dt);
+  player.onGround=false;
+  if(next.y<1){next.y=1;player.vel.y=0;player.onGround=true;}
+  player.pos.copy(next);
+}
+
+/* ==============================================================
+   END
+   ============================================================== */
+</script>
+</body>
+</html>
